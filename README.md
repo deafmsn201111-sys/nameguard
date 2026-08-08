@@ -1,78 +1,69 @@
-# NEAR NameGuard 🔒
+# NameGuard 🛡️
 
-**Anti-squatting protection for NEAR accounts**
+Anti-squatting scoring service for NEAR accounts.
 
-Check if a NEAR account is a squatter, report suspicious accounts, and manage your watchlist — all on-chain.
+## Contract
 
----
+Rust smart contract for NEAR blockchain that evaluates whether an account looks like a squatter.
 
-## Why?
+### Score factors
 
-- Squatters mass-register `.near` domains and resell them
-- New users inherit spam activity from previous owners
-- Projects lose their brand name to impersonators
+| Factor | Max score | Description |
+|---|---|---|
+| name_length | 30 | Very short names (1-2 chars: +30, 3-4 chars: +15) |
+| auto_generated | 25 | Pattern matches bots (digits only, letter+digits) |
+| trademark | 50 | Name matches a protected trademark |
+| many_accounts | 35 | Creator owns more accounts than allowed |
 
-NameGuard solves this with community-driven reporting + risk scoring.
+Total score capped at **100**. Higher = more likely a squatter.
 
-## Features
-
-- ✅ **Risk Score** — check any `.near` account (0-100)
-- ✅ **Report** — flag squatters, impersonators, spam
-- ✅ **Watchlist** — track suspicious accounts
-- ✅ **Transparent** — all data on-chain, no central DB
-
-## Quick Start
+### Build & Deploy
 
 ```bash
-# 1. Install tools
-npm install -g near-cli
-cargo install cargo-near
+# Build WASM
+rustup target add wasm32-unknown-unknown
+cargo build --target wasm32-unknown-unknown --release
 
-# 2. Auth
-near login
+# Deploy (testnet)
+near deploy nameguard.testnet ./target/wasm32-unknown-unknown/release/near_antisquat.wasm
 
-# 3. Build & deploy to testnet
-cd contract
-cargo near build
-near deploy nameguard.testnet --wasmFile target/wasm32-unknown-unknown/release/nameguard.wasm
+# Init
+near call nameguard.testnet new '{"max_accounts_per_owner": 5}' --accountId nameguard.testnet
 
-# 4. Try it
-near view nameguard.testnet get_risk_score '{"account_id": "test.near"}'
-near call nameguard.testnet report_account \
-  '{"account_id": "suspicious.near", "reason": "Squatter", "description": "Mass registered"}' \
-  --accountId YOUR_ACCOUNT.near --deposit 0.001
+# Check an account
+near call nameguard.testnet check '{"account_id": "suspicious.near"}' --accountId nameguard.testnet
+
+# Add trademark
+near call nameguard.testnet add_trademark '{"name": "google"}' --accountId nameguard.testnet
 ```
 
-## Contract Methods
+## Frontend
 
-| Method | Type | Description |
-|--------|------|-------------|
-| `get_risk_score(account_id)` | View | Returns RiskScore (0-100) with flags |
-| `get_reports(account_id)` | View | List all reports on account |
-| `is_watched(account_id)` | View | Check if account is watched |
-| `get_watchers(account_id)` | View | Who's watching this account |
-| `report_account(...)` | Call (0.001N) | Report an account |
-| `add_to_watchlist(...)` | Call (0.001N) | Watch an account |
-| `remove_from_watchlist(...)` | Call | Stop watching |
-
-## Deploy to Mainnet
+React + Vite + near-api-js.
 
 ```bash
-near create-account nameguard.near --masterAccount YOUR_MAIN.near --initialBalance 5
-near deploy nameguard.near --wasmFile target/wasm32-unknown-unknown/release/nameguard.wasm
-near call nameguard.near new --accountId nameguard.near
+cd frontend
+npm install
+npm run dev
 ```
 
-## Frontend (coming soon)
+## Structure
 
-React + Next.js app with search, risk meter, report form, watchlist dashboard, and account history via NearBlocks API.
-
-## Tech Stack
-
-- **Smart Contract:** Rust + NEAR SDK
-- **Frontend:** React, Next.js, Tailwind CSS
-- **Infrastructure:** NEAR Protocol, NearBlocks API, Vercel
-
-## License
-
-MIT
+```
+├── Cargo.toml
+├── src/
+│   └── lib.rs          # NEAR contract
+├── frontend/
+│   ├── index.html
+│   ├── package.json
+│   ├── tsconfig.json
+│   ├── vite.config.ts
+│   └── src/
+│       ├── main.tsx
+│       ├── App.tsx
+│       ├── vite-env.d.ts
+│       └── near/
+│           ├── config.ts
+│           └── wallet.ts
+└── README.md
+```
