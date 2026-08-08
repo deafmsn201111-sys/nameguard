@@ -1,45 +1,50 @@
 # NameGuard 🛡️
 
-Anti-squatting scoring service for NEAR accounts.
+Anti-squatting scoring for NEAR accounts.
 
-## Contract
+## Live
 
-Rust smart contract for NEAR blockchain that evaluates whether an account looks like a squatter.
+**Contract:** `nameguard.testnet` (testnet)
 
-### Score factors
+## Contract Methods
 
-| Factor | Max score | Description |
+| Method | Type | Description |
 |---|---|---|
-| name_length | 30 | Very short names (1-2 chars: +30, 3-4 chars: +15) |
-| auto_generated | 25 | Pattern matches bots (digits only, letter+digits) |
-| trademark | 50 | Name matches a protected trademark |
-| many_accounts | 35 | Creator owns more accounts than allowed |
+| `new(max_accounts_per_owner)` | Init | Initialize contract |
+| `check(account_id)` | Call | Score an account (0-100) |
+| `get_report(account_id)` | View | Get cached report |
+| `add_trademark(name)` | Call | Add protected name (owner only) |
+| `remove_trademark(name)` | Call | Remove protected name |
+| `list_trademarks()` | View | List all trademarks |
+| `set_max_accounts(max)` | Call | Set max accounts per owner |
 
-Total score capped at **100**. Higher = more likely a squatter.
+## Scoring
 
-### Build & Deploy
+| Factor | Max | What it detects |
+|---|---|---|
+| `name_length` | 30 | 1-2 chars → +30, 3-4 chars → +15 |
+| `auto_generated` | 25 | Digits-only or letter+digits pattern |
+| `trademark` | 50 | Name matches a protected trademark |
+| `many_accounts` | 35 | Creator owns too many accounts *(coming soon)* |
+
+**Total capped at 100.** Higher = more likely a squatter.
+
+## Build
 
 ```bash
-# Build WASM
-rustup target add wasm32-unknown-unknown
 cargo build --target wasm32-unknown-unknown --release
+```
 
-# Deploy (testnet)
-near deploy nameguard.testnet ./target/wasm32-unknown-unknown/release/near_antisquat.wasm
+## Deploy
 
-# Init
-near call nameguard.testnet new '{"max_accounts_per_owner": 5}' --accountId nameguard.testnet
-
-# Check an account
-near call nameguard.testnet check '{"account_id": "suspicious.near"}' --accountId nameguard.testnet
-
-# Add trademark
-near call nameguard.testnet add_trademark '{"name": "google"}' --accountId nameguard.testnet
+```bash
+near contract deploy nameguard.testnet use-file ./target/wasm32-unknown-unknown/release/nameguard.wasm without-init-call network-config testnet sign-with-keychain send
+near contract call-function as-transaction nameguard.testnet new json-args '{"max_accounts_per_owner":5}' prepaid-gas '30.0 Tgas' attached-deposit '0 NEAR' sign-as nameguard.testnet network-config testnet sign-with-keychain send
 ```
 
 ## Frontend
 
-React + Vite + near-api-js.
+React + Vite + near-api-js (in `frontend/`).
 
 ```bash
 cd frontend
@@ -51,13 +56,12 @@ npm run dev
 
 ```
 ├── Cargo.toml
-├── src/
-│   └── lib.rs          # NEAR contract
+├── src/lib.rs              # NEAR contract
 ├── frontend/
-│   ├── index.html
 │   ├── package.json
 │   ├── tsconfig.json
 │   ├── vite.config.ts
+│   ├── index.html
 │   └── src/
 │       ├── main.tsx
 │       ├── App.tsx
@@ -65,5 +69,10 @@ npm run dev
 │       └── near/
 │           ├── config.ts
 │           └── wallet.ts
-└── README.md
+├── README.md
+└── .gitignore
 ```
+
+## License
+
+MIT
