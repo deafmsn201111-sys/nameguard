@@ -1,13 +1,7 @@
-# Ignore wasm build artifacts
-contract/target/
-.vercel
-.next
-node_modules/
-
-# Environment
+/target
+frontend/node_modules
+frontend/dist
+*.wasm
 .env
 .env.local
-
-# OS
 .DS_Store
-Thumbs.db
