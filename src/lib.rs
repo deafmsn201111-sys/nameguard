@@ -8,6 +8,7 @@ use std::collections::HashSet;
 
 const SOCIAL_DB: &str = "social.near";
 const GAS_FOR_CALL: Gas = Gas::from_tgas(20);
+const SUGGESTION_COUNT: usize = 5;
 
 // ─── Structures ──────────────────────────────────────────────────────────────
 
@@ -23,6 +24,14 @@ pub struct ScoreReason {
     pub factor: String,
     pub score: u8,
     pub detail: String,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
+pub struct AccountStatus {
+    pub account_id: String,
+    pub exists: bool,
+    pub score_report: Option<ScoreReport>,
+    pub suggestions: Vec<String>,
 }
 
 // ─── Cross-contract interface ────────────────────────────────────────────────
@@ -125,6 +134,32 @@ impl NameGuard {
         self.scores.get(&account_id)
     }
 
+    // ─── Account Status + Suggestions ────────────────────────────────────────
+
+    pub fn check_status(&mut self, account_id: AccountId) -> AccountStatus {
+        let name_str = account_id.as_str().to_lowercase();
+        let exists = account_exists_on_chain(&account_id);
+
+        let score_report = if exists {
+            Some(self.check(account_id.clone()))
+        } else {
+            None
+        };
+
+        let suggestions = if exists {
+            generate_suggestions(&name_str, &self.trademarks)
+        } else {
+            vec![]
+        };
+
+        AccountStatus {
+            account_id: account_id.to_string(),
+            exists,
+            score_report,
+            suggestions,
+        }
+    }
+
     // ─── On-chain Lookup (SocialDB) ──────────────────────────────────────────
 
     pub fn check_with_lookup(&mut self, account_id: AccountId) -> Promise {
@@ -215,6 +250,68 @@ fn is_auto_generated(name: &str) -> bool {
         && bytes[1..].iter().all(|c| c.is_ascii_digit())
 }
 
+fn account_exists_on_chain(account_id: &AccountId) -> bool {
+    env::account_exists(account_id)
+}
+
+fn generate_suggestions(name: &str, trademarks: &[String]) -> Vec<String> {
+    let base = name
+        .trim_end_matches(".near")
+        .trim_end_matches(".testnet")
+        .trim_end_matches(".tgz");
+
+    let mut suggestions = Vec::new();
+    let tm_set: HashSet<&str> = trademarks.iter().map(|s| s.as_str()).collect();
+
+    let suffixes = ["1", "01", "real", "official", "near"];
+    for sfx in &suffixes {
+        let candidate = format!("{}{}.near", base, sfx);
+        if !suggestions.contains(&candidate) {
+            suggestions.push(candidate);
+        }
+        if suggestions.len() >= SUGGESTION_COUNT {
+            break;
+        }
+    }
+
+    if suggestions.len() < SUGGESTION_COUNT {
+        let alt_names = [
+            format!("{}_{}.near", base, "near"),
+            format!("{}-{}.near", base, "near"),
+            format!("{}{}.near", base, "near"),
+        ];
+        for c in &alt_names {
+            if !suggestions.contains(c) {
+                suggestions.push(c.clone());
+            }
+            if suggestions.len() >= SUGGESTION_COUNT {
+                break;
+            }
+        }
+    }
+
+    suggestions.retain(|s| {
+        let sug_base = s.trim_end_matches(".near");
+        !tm_set.contains(sug_base)
+    });
+
+    if base.len() <= 3 && suggestions.len() < SUGGESTION_COUNT {
+        let prefixes = ["get", "use", "the", "my", "its"];
+        for p in &prefixes {
+            let candidate = format!("{}{}.near", p, base);
+            if !suggestions.contains(&candidate) {
+                suggestions.push(candidate);
+            }
+            if suggestions.len() >= SUGGESTION_COUNT {
+                break;
+            }
+        }
+    }
+
+    suggestions.truncate(SUGGESTION_COUNT);
+    suggestions
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -243,6 +340,33 @@ mod tests {
         assert_eq!(report.overall_score, 50);
 
         let report = contract.check("a12345.near".parse().unwrap());
-        assert_eq!(report.overall_score, 40); // 15 (short) + 25 (auto)
+        assert_eq!(report.overall_score, 40);
+    }
+
+    #[test]
+    fn test_generate_suggestions() {
+        let trademarks = vec!["google".to_string()];
+
+        let suggestions = generate_suggestions("vitalik.near", &trademarks);
+        assert!(!suggestions.is_empty());
+        assert!(suggestions.len() <= SUGGESTION_COUNT);
+        for s in &suggestions {
+            assert!(s.ends_with(".near"), "{} should end with .near", s);
+        }
+
+        let google_sug = generate_suggestions("google.near", &trademarks);
+        for s in &google_sug {
+            let sug_base = s.trim_end_matches(".near");
+            assert!(!trademarks.contains(&sug_base.to_string()), "{} should not be a trademark", s);
+        }
+    }
+
+    #[test]
+    fn test_check_status_no_account() {
+        let mut contract = NameGuard::new(5);
+        let status = contract.check_status("nonexistent12345.near".parse().unwrap());
+        assert_eq!(status.account_id, "nonexistent12345.near".to_string());
+        assert!(!status.exists);
+        assert!(status.score_report.is_none());
     }
 }
