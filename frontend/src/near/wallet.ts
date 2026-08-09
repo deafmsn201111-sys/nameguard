@@ -1,9 +1,14 @@
-import { connect, keyStores, WalletConnection } from "near-api-js";
+import { connect, keyStores, WalletConnection, Contract } from "near-api-js";
 import config from "./config";
 
 const nearConfig = config();
 
 let wallet: WalletConnection | null = null;
+
+interface NameGuardContract extends Contract {
+  get_report: (args: { account_id: string }) => Promise<any>;
+  check: (args: { account_id: string }) => Promise<any>;
+}
 
 export async function initWallet(): Promise<WalletConnection> {
   if (wallet) return wallet;
@@ -14,25 +19,36 @@ export async function initWallet(): Promise<WalletConnection> {
   return wallet;
 }
 
-export async function checkAccount(accountId: string): Promise<any> {
-  const w = await initWallet();
-  const contract = new w.account().contract({
-    contractId: nearConfig.contractId,
+function getContract(account: any): NameGuardContract {
+  return new Contract(account, nearConfig.contractId, {
     viewMethods: ["get_report"],
     changeMethods: ["check"],
-  });
+    useLocalViewExecution: false,
+  }) as NameGuardContract;
+}
 
-  // Try cached first
-  const cached = await (contract as any).get_report({ account_id: accountId });
-  if (cached) return cached;
+export async function checkAccount(accountId: string): Promise<any> {
+  const w = await initWallet();
 
-  // Compute fresh score
-  return await (contract as any).check({ account_id: accountId });
+  if (w.isSignedIn()) {
+    const account = w.account();
+    const contract = getContract(account);
+    const cached = await contract.get_report({ account_id: accountId });
+    if (cached) return cached;
+    return await contract.check({ account_id: accountId });
+  }
+
+  // Read-only check without signing
+  const keyStore = new keyStores.BrowserLocalStorageKeyStore();
+  const near = await connect({ ...nearConfig, keyStore, headers: {} });
+  const account = near.account("");
+  const contract = getContract(account);
+  return await contract.get_report({ account_id: accountId });
 }
 
 export function signIn() {
   if (!wallet) return;
-  wallet.requestSignIn({ contractId: nearConfig.contractId });
+  (wallet as any).requestSignIn({ contractId: nearConfig.contractId });
 }
 
 export function signOut() {
