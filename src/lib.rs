@@ -4,13 +4,9 @@ use near_sdk::{env, ext_contract, near_bindgen, require, AccountId, Gas, NearTok
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-// ─── Constants ───────────────────────────────────────────────────────────────
-
 const SOCIAL_DB: &str = "social.near";
 const GAS_FOR_CALL: Gas = Gas::from_tgas(20);
 const SUGGESTION_COUNT: usize = 5;
-
-// ─── Structures ──────────────────────────────────────────────────────────────
 
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
 pub struct ScoreReport {
@@ -34,14 +30,10 @@ pub struct AccountStatus {
     pub suggestions: Vec<String>,
 }
 
-// ─── Cross-contract interface ────────────────────────────────────────────────
-
 #[ext_contract(ext_self)]
 trait ExtSelf {
     fn handle_social_result(&mut self, account_id: AccountId, #[callback_unwrap] result: String) -> ScoreReport;
 }
-
-// ─── Contract ────────────────────────────────────────────────────────────────
 
 #[near_bindgen(contract_state(key = b"STATE"))]
 #[derive(BorshSerialize, BorshDeserialize)]
@@ -71,8 +63,6 @@ impl NameGuard {
             max_accounts_per_owner,
         }
     }
-
-    // ─── Scoring ─────────────────────────────────────────────────────────────
 
     pub fn check(&mut self, account_id: AccountId) -> ScoreReport {
         let account_str = account_id.as_str().to_lowercase();
@@ -134,11 +124,9 @@ impl NameGuard {
         self.scores.get(&account_id)
     }
 
-    // ─── Account Status + Suggestions ────────────────────────────────────────
-
-    pub fn check_status(&mut self, account_id: AccountId) -> AccountStatus {
+    // Фронт сам проверяет существует аккаунт или нет, мы только скор и подсказки
+    pub fn check_status(&mut self, account_id: AccountId, exists: bool) -> AccountStatus {
         let name_str = account_id.as_str().to_lowercase();
-        let exists = account_exists_on_chain(&account_id);
 
         let score_report = if exists {
             Some(self.check(account_id.clone()))
@@ -146,11 +134,7 @@ impl NameGuard {
             None
         };
 
-        let suggestions = if exists {
-            generate_suggestions(&name_str, &self.trademarks)
-        } else {
-            vec![]
-        };
+        let suggestions = generate_suggestions(&name_str, &self.trademarks);
 
         AccountStatus {
             account_id: account_id.to_string(),
@@ -159,8 +143,6 @@ impl NameGuard {
             suggestions,
         }
     }
-
-    // ─── On-chain Lookup (SocialDB) ──────────────────────────────────────────
 
     pub fn check_with_lookup(&mut self, account_id: AccountId) -> Promise {
         let report = self.check(account_id.clone());
@@ -202,8 +184,6 @@ impl NameGuard {
         report
     }
 
-    // ─── Trademark Management ────────────────────────────────────────────────
-
     pub fn add_trademark(&mut self, name: String) {
         self.assert_owner();
         let lower = name.to_lowercase();
@@ -234,8 +214,6 @@ impl NameGuard {
     }
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
 fn is_auto_generated(name: &str) -> bool {
     let name = name.trim_end_matches(".near").trim_end_matches(".testnet");
     if name.is_empty() {
@@ -248,10 +226,6 @@ fn is_auto_generated(name: &str) -> bool {
     bytes.len() > 1
         && bytes[0].is_ascii_lowercase()
         && bytes[1..].iter().all(|c| c.is_ascii_digit())
-}
-
-fn account_exists_on_chain(account_id: &AccountId) -> bool {
-    env::account_exists(account_id)
 }
 
 fn generate_suggestions(name: &str, trademarks: &[String]) -> Vec<String> {
@@ -312,8 +286,6 @@ fn generate_suggestions(name: &str, trademarks: &[String]) -> Vec<String> {
     suggestions
 }
 
-// ─── Tests ───────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,9 +336,13 @@ mod tests {
     #[test]
     fn test_check_status_no_account() {
         let mut contract = NameGuard::new(5);
-        let status = contract.check_status("nonexistent12345.near".parse().unwrap());
+        let status = contract.check_status(
+            "nonexistent12345.near".parse().unwrap(),
+            false,
+        );
         assert_eq!(status.account_id, "nonexistent12345.near".to_string());
         assert!(!status.exists);
         assert!(status.score_report.is_none());
     }
 }
+
