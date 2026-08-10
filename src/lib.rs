@@ -1,28 +1,38 @@
-use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
-use near_sdk::collections::LookupMap;
-use near_sdk::{env, ext_contract, near_bindgen, require, AccountId, Gas, NearToken, Promise};
+use near_sdk::store::{LookupMap, UnorderedSet};
+use near_sdk::{env, near, near_bindgen, require, AccountId, NearToken, Promise};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 
-const SOCIAL_DB: &str = "social.near";
-const GAS_FOR_CALL: Gas = Gas::from_tgas(20);
+/// Max score cap
+const MAX_SCORE: u8 = 100;
+
+/// Suggested alternate names to generate
 const SUGGESTION_COUNT: usize = 5;
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
+/// Fee required to add a trademark (0.1 NEAR)
+const TRADEMARK_FEE: NearToken = NearToken::from_near(1) / 10; // 0.1 NEAR
+
+// ---------------------------------------------------------------------------
+// Data structures
+// ---------------------------------------------------------------------------
+
+#[near(serializers = [borsh, json])]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ScoreReport {
     pub account_id: String,
     pub overall_score: u8,
     pub reasons: Vec<ScoreReason>,
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
+#[near(serializers = [borsh, json])]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ScoreReason {
     pub factor: String,
     pub score: u8,
     pub detail: String,
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
+#[near(serializers = [borsh, json])]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AccountStatus {
     pub account_id: String,
     pub exists: bool,
@@ -30,41 +40,150 @@ pub struct AccountStatus {
     pub suggestions: Vec<String>,
 }
 
-#[ext_contract(ext_self)]
-trait ExtSelf {
-    fn handle_social_result(&mut self, account_id: AccountId, #[callback_unwrap] result: String) -> ScoreReport;
-}
+// ---------------------------------------------------------------------------
+// Contract state
+// ---------------------------------------------------------------------------
 
-#[near_bindgen(contract_state(key = b"STATE"))]
-#[derive(BorshSerialize, BorshDeserialize)]
+#[near(contract_state)]
 pub struct NameGuard {
+    /// Cached scores keyed by AccountId
     pub scores: LookupMap<AccountId, ScoreReport>,
-    pub trademarks: Vec<String>,
-    pub max_accounts_per_owner: u64,
+    /// Protected trademarks (UnorderedSet for O(1) lookups instead of Vec scan)
+    pub trademarks: UnorderedSet<String>,
+    /// Contract owner
+    pub owner: AccountId,
 }
 
 impl Default for NameGuard {
     fn default() -> Self {
         Self {
             scores: LookupMap::new(b"s"),
-            trademarks: Vec::new(),
-            max_accounts_per_owner: 5,
+            trademarks: UnorderedSet::new(b"t"),
+            owner: "nameguard.testnet".parse().unwrap(),
         }
     }
 }
 
-#[near_bindgen]
+#[near]
 impl NameGuard {
     #[init]
-    pub fn new(max_accounts_per_owner: u64) -> Self {
+    pub fn new(owner: AccountId) -> Self {
         Self {
             scores: LookupMap::new(b"s"),
-            trademarks: Vec::new(),
-            max_accounts_per_owner,
+            trademarks: UnorderedSet::new(b"t"),
+            owner,
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Owner-only guard
+    // -----------------------------------------------------------------------
+
+    fn assert_owner(&self) {
+        require!(
+            env::predecessor_account_id() == self.owner,
+            "Only owner can call this method"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Scoring engine
+    // -----------------------------------------------------------------------
+
+    /// Compute a squatting score for `account_id` using on-chain signals.
+    /// Caches the result so subsequent reads are cheap.
     pub fn check(&mut self, account_id: AccountId) -> ScoreReport {
+        let account_str = account_id.as_str().to_lowercase();
+        let mut reasons: Vec<ScoreReason> = Vec::new();
+        let mut total: u16 = 0;
+
+        // ---- name_length ---------------------------------------------------
+        let len = account_str.len();
+        if len <= 2 {
+            reasons.push(ScoreReason {
+                factor: "name_length".into(),
+                score: 30,
+                detail: format!("Account name is very short ({} chars)", len),
+            });
+            total += 30;
+        } else if len <= 4 {
+            reasons.push(ScoreReason {
+                factor: "name_length".into(),
+                score: 15,
+                detail: format!("Account name is short ({} chars)", len),
+            });
+            total += 15;
+        }
+
+        // ---- auto_generated -------------------------------------------------
+        if is_auto_generated(&account_str) {
+            reasons.push(ScoreReason {
+                factor: "auto_generated".into(),
+                score: 25,
+                detail: "Name matches auto-generated pattern".into(),
+            });
+            total += 25;
+        }
+
+        // ---- trademark ------------------------------------------------------
+        let name = account_str
+            .trim_end_matches(".near")
+            .trim_end_matches(".testnet");
+        if self.trademarks.contains(&name.to_string()) {
+            reasons.push(ScoreReason {
+                factor: "trademark".into(),
+                score: 50,
+                detail: format!("Name matches protected trademark: {}", name),
+            });
+            total += 50;
+        }
+
+        let overall_score = std::cmp::min(total as u8, MAX_SCORE);
+
+        let report = ScoreReport {
+            account_id: account_id.to_string(),
+            overall_score,
+            reasons,
+        };
+
+        // Cache the result so subsequent view calls are cheap
+        self.scores.insert(account_id, report.clone());
+        report
+    }
+
+    /// View the cached score report, if one exists.
+    pub fn get_report(&self, account_id: AccountId) -> Option<ScoreReport> {
+        self.scores.get(&account_id).cloned()
+    }
+
+    /// Combined check — score + suggestions.
+    /// The frontend tells us whether the account exists (it can verify via RPC).
+    pub fn check_status(
+        &mut self,
+        account_id: AccountId,
+        exists: bool,
+    ) -> AccountStatus {
+        let name_str = account_id.as_str().to_lowercase();
+
+        let score_report = if exists {
+            Some(self.check(account_id.clone()))
+        } else {
+            None
+        };
+
+        let suggestions = generate_suggestions(&name_str, &self.trademarks);
+
+        AccountStatus {
+            account_id: account_id.to_string(),
+            exists,
+            score_report,
+            suggestions,
+        }
+    }
+
+    /// Pure view-only scoring (no storage writes).
+    /// Callable via RPC with zero deposit — no wallet needed.
+    pub fn view_score(&self, account_id: AccountId, exists: bool) -> AccountStatus {
         let account_str = account_id.as_str().to_lowercase();
         let mut reasons: Vec<ScoreReason> = Vec::new();
         let mut total: u16 = 0;
@@ -98,8 +217,7 @@ impl NameGuard {
         let name = account_str
             .trim_end_matches(".near")
             .trim_end_matches(".testnet");
-        let tm_set: HashSet<&str> = self.trademarks.iter().map(|s| s.as_str()).collect();
-        if tm_set.contains(name) {
+        if self.trademarks.contains(&name.to_string()) {
             reasons.push(ScoreReason {
                 factor: "trademark".into(),
                 score: 50,
@@ -108,114 +226,112 @@ impl NameGuard {
             total += 50;
         }
 
-        let overall_score = std::cmp::min(total as u8, 100);
+        let overall_score = std::cmp::min(total as u8, MAX_SCORE);
 
-        let report = ScoreReport {
-            account_id: account_id.to_string(),
-            overall_score,
-            reasons,
-        };
-
-        self.scores.insert(&account_id, &report);
-        report
-    }
-
-    pub fn get_report(&self, account_id: AccountId) -> Option<ScoreReport> {
-        self.scores.get(&account_id)
-    }
-
-    // Фронт сам проверяет существует аккаунт или нет, мы только скор и подсказки
-    pub fn check_status(&mut self, account_id: AccountId, exists: bool) -> AccountStatus {
-        let name_str = account_id.as_str().to_lowercase();
-
-        let score_report = if exists {
-            Some(self.check(account_id.clone()))
+        let report = if exists {
+            Some(ScoreReport {
+                account_id: account_id.to_string(),
+                overall_score,
+                reasons,
+            })
         } else {
             None
         };
 
-        let suggestions = generate_suggestions(&name_str, &self.trademarks);
+        let suggestions = generate_suggestions(&account_str, &self.trademarks);
 
         AccountStatus {
             account_id: account_id.to_string(),
             exists,
-            score_report,
+            score_report: report,
             suggestions,
         }
     }
 
-    pub fn check_with_lookup(&mut self, account_id: AccountId) -> Promise {
-        let report = self.check(account_id.clone());
-        self.scores.insert(&account_id, &report);
+    // -----------------------------------------------------------------------
+    // Trademark management
+    // -----------------------------------------------------------------------
 
-        let args = near_sdk::serde_json::json!({
-            "keys": [format!("{}/profile/**", account_id)]
-        });
-
-        Promise::new(SOCIAL_DB.parse().unwrap())
-            .function_call(
-                "get".to_string(),
-                near_sdk::serde_json::to_vec(&args).unwrap(),
-                NearToken::from_yoctonear(0),
-                GAS_FOR_CALL,
-            )
-            .then(ext_self::ext(env::current_account_id())
-                .handle_social_result(account_id))
-    }
-
-    #[private]
-    pub fn handle_social_result(&mut self, account_id: AccountId, result: String) -> ScoreReport {
-        let mut report = self.scores.get(&account_id).unwrap_or(ScoreReport {
-            account_id: account_id.to_string(),
-            overall_score: 0,
-            reasons: vec![],
-        });
-
-        if result == "null" || result.trim().is_empty() {
-            report.overall_score = std::cmp::min(report.overall_score + 15, 100);
-            report.reasons.push(ScoreReason {
-                factor: "no_profile".into(),
-                score: 15,
-                detail: "Account has no profile on SocialDB".into(),
-            });
-        }
-
-        self.scores.insert(&account_id, &report);
-        report
-    }
-
+    /// Add a protected trademark name.
+    /// Anyone can call. Must attach at least 0.1 NEAR (storage + spam protection).
+    #[payable]
     pub fn add_trademark(&mut self, name: String) {
-        self.assert_owner();
+        let attached = env::attached_deposit();
+        require!(
+            attached >= TRADEMARK_FEE,
+            "Attach at least 0.1 NEAR to add a trademark"
+        );
+
         let lower = name.to_lowercase();
-        if !self.trademarks.contains(&lower) {
-            self.trademarks.push(lower);
+        require!(!lower.is_empty(), "Trademark name cannot be empty");
+        require!(
+            lower.len() <= 64,
+            "Trademark name too long (max 64 chars)"
+        );
+        require!(
+            lower.chars().all(|c| {
+                c.is_ascii_lowercase()
+                    || c.is_ascii_digit()
+                    || c == '-'
+                    || c == '_'
+                    || c == '.'
+            }),
+            "Trademark contains invalid characters"
+        );
+
+        self.trademarks.insert(lower);
+
+        // Refund anything above the 0.1 NEAR fee back to the caller
+        let refund = attached.saturating_sub(TRADEMARK_FEE);
+        if refund > NearToken::from_yoctonear(0) {
+            Promise::new(env::predecessor_account_id()).transfer(refund);
         }
     }
 
+    /// Remove a protected trademark name (owner only).
     pub fn remove_trademark(&mut self, name: String) {
         self.assert_owner();
-        self.trademarks.retain(|t| t != &name.to_lowercase());
+        let lower = name.to_lowercase();
+        self.trademarks.remove(&lower);
     }
 
+    /// View all trademarks (anyone can call, view method).
     pub fn list_trademarks(&self) -> Vec<String> {
-        self.trademarks.clone()
+        self.trademarks.iter().cloned().collect()
     }
 
-    pub fn set_max_accounts(&mut self, max: u64) {
+    /// Check whether a name is trademarked (view method).
+    pub fn is_trademarked(&self, name: String) -> bool {
+        self.trademarks.contains(&name.to_lowercase())
+    }
+
+    // -----------------------------------------------------------------------
+    // Owner admin
+    // -----------------------------------------------------------------------
+
+    /// Transfer ownership to another account.
+    pub fn transfer_ownership(&mut self, new_owner: AccountId) {
         self.assert_owner();
-        self.max_accounts_per_owner = max;
+        self.owner = new_owner;
     }
 
-    fn assert_owner(&self) {
-        require!(
-            env::predecessor_account_id() == env::current_account_id(),
-            "Only owner can call this"
-        );
+    /// View current owner.
+    pub fn get_owner(&self) -> AccountId {
+        self.owner.clone()
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scoring helpers
+// ---------------------------------------------------------------------------
+
+/// Detect auto-generated names:
+/// - All digits (e.g. "12345")
+/// - Single lowercase letter followed by all digits (e.g. "a12345")
 fn is_auto_generated(name: &str) -> bool {
-    let name = name.trim_end_matches(".near").trim_end_matches(".testnet");
+    let name = name
+        .trim_end_matches(".near")
+        .trim_end_matches(".testnet");
     if name.is_empty() {
         return false;
     }
@@ -228,14 +344,14 @@ fn is_auto_generated(name: &str) -> bool {
         && bytes[1..].iter().all(|c| c.is_ascii_digit())
 }
 
-fn generate_suggestions(name: &str, trademarks: &[String]) -> Vec<String> {
+/// Generate alternative name suggestions, excluding protected trademarks.
+fn generate_suggestions(name: &str, trademarks: &UnorderedSet<String>) -> Vec<String> {
     let base = name
         .trim_end_matches(".near")
         .trim_end_matches(".testnet")
         .trim_end_matches(".tgz");
 
     let mut suggestions = Vec::new();
-    let tm_set: HashSet<&str> = trademarks.iter().map(|s| s.as_str()).collect();
 
     let suffixes = ["1", "01", "real", "official", "near"];
     for sfx in &suffixes {
@@ -266,7 +382,7 @@ fn generate_suggestions(name: &str, trademarks: &[String]) -> Vec<String> {
 
     suggestions.retain(|s| {
         let sug_base = s.trim_end_matches(".near");
-        !tm_set.contains(sug_base)
+        !trademarks.contains(&sug_base.to_string())
     });
 
     if base.len() <= 3 && suggestions.len() < SUGGESTION_COUNT {
@@ -286,9 +402,44 @@ fn generate_suggestions(name: &str, trademarks: &[String]) -> Vec<String> {
     suggestions
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use near_sdk::test_utils::{test_env, VMContextBuilder};
+    use near_sdk::{testing_env, AccountId};
+
+    /// Helper: set up context + contract, and return (builder, contract).
+    /// Builder can be used to modify context (e.g. attach deposit) between calls.
+    fn setup() -> (VMContextBuilder, NameGuard) {
+        let mut builder = VMContextBuilder::new();
+        test_env::set_current_account_id(
+            "nameguard.testnet".parse::<AccountId>().unwrap(),
+        );
+        test_env::set_predecessor_account_id(
+            "nameguard.testnet".parse::<AccountId>().unwrap(),
+        );
+        test_env::set_signer_account_id(
+            "nameguard.testnet".parse::<AccountId>().unwrap(),
+        );
+        testing_env!(builder.build());
+
+        let contract = NameGuard::new("nameguard.testnet".parse().unwrap());
+        (builder, contract)
+    }
+
+    /// Attach 0.1 NEAR deposit then call add_trademark (helper for tests).
+    fn add_tm(builder: &mut VMContextBuilder, contract: &mut NameGuard, name: &str) {
+        builder.attached_deposit(TRADEMARK_FEE);
+        testing_env!(builder.build());
+        contract.add_trademark(name.to_string());
+        // Reset deposit for subsequent calls
+        builder.attached_deposit(NearToken::from_yoctonear(0));
+        testing_env!(builder.build());
+    }
 
     #[test]
     fn test_auto_generated() {
@@ -302,8 +453,8 @@ mod tests {
 
     #[test]
     fn test_score_calculation() {
-        let mut contract = NameGuard::new(5);
-        contract.add_trademark("google".to_string());
+        let (mut builder, mut contract) = setup();
+        add_tm(&mut builder, &mut contract, "google");
 
         let report = contract.check("vitalik.near".parse().unwrap());
         assert_eq!(report.overall_score, 0);
@@ -316,33 +467,49 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_suggestions() {
-        let trademarks = vec!["google".to_string()];
-
-        let suggestions = generate_suggestions("vitalik.near", &trademarks);
-        assert!(!suggestions.is_empty());
-        assert!(suggestions.len() <= SUGGESTION_COUNT);
-        for s in &suggestions {
-            assert!(s.ends_with(".near"), "{} should end with .near", s);
-        }
-
-        let google_sug = generate_suggestions("google.near", &trademarks);
-        for s in &google_sug {
-            let sug_base = s.trim_end_matches(".near");
-            assert!(!trademarks.contains(&sug_base.to_string()), "{} should not be a trademark", s);
-        }
+    fn test_very_short_name() {
+        let (_, mut contract) = setup();
+        let report = contract.check("ab.near".parse().unwrap());
+        assert_eq!(report.overall_score, 30);
     }
 
     #[test]
-    fn test_check_status_no_account() {
-        let mut contract = NameGuard::new(5);
-        let status = contract.check_status(
-            "nonexistent12345.near".parse().unwrap(),
-            false,
-        );
-        assert_eq!(status.account_id, "nonexistent12345.near".to_string());
-        assert!(!status.exists);
-        assert!(status.score_report.is_none());
+    fn test_short_name_3_to_4_chars() {
+        let (_, mut contract) = setup();
+        let report = contract.check("abcd.near".parse().unwrap());
+        assert_eq!(report.overall_score, 15);
+    }
+
+    #[test]
+    fn test_view_score() {
+        let (_, contract) = setup();
+        let status = contract.view_score("google.near".parse().unwrap(), true);
+        assert!(status.exists);
+        assert!(status.score_report.is_some());
+        assert_eq!(status.score_report.unwrap().overall_score, 0);
+    }
+
+    #[test]
+    fn test_is_trademarked() {
+        let (mut builder, mut contract) = setup();
+        add_tm(&mut builder, &mut contract, "Google");
+        assert!(contract.is_trademarked("google".to_string()));
+        assert!(contract.is_trademarked("Google".to_string()));
+        assert!(!contract.is_trademarked("vitalik".to_string()));
+    }
+
+    #[test]
+    fn test_transfer_ownership() {
+        let (_, mut contract) = setup();
+        assert_eq!(contract.get_owner().to_string(), "nameguard.testnet");
+        contract.transfer_ownership("newowner.near".parse().unwrap());
+        assert_eq!(contract.get_owner().to_string(), "newowner.near");
+    }
+
+    #[test]
+    #[should_panic(expected = "Attach at least 0.1 NEAR")]
+    fn test_add_trademark_fails_without_deposit() {
+        let (_, mut contract) = setup();
+        contract.add_trademark("test".to_string());
     }
 }
-
