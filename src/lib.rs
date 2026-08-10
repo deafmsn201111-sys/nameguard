@@ -1,5 +1,5 @@
-use near_sdk::store::{LookupMap, UnorderedSet};
-use near_sdk::{env, near, near_bindgen, require, AccountId, NearToken, Promise};
+use near_sdk::store::{IterableSet, LookupMap};
+use near_sdk::{env, near, require, AccountId, NearToken, Promise};
 use serde::{Deserialize, Serialize};
 
 /// Max score cap
@@ -9,14 +9,14 @@ const MAX_SCORE: u8 = 100;
 const SUGGESTION_COUNT: usize = 5;
 
 /// Fee required to add a trademark (0.1 NEAR)
-const TRADEMARK_FEE: NearToken = NearToken::from_near(1) / 10; // 0.1 NEAR
+const TRADEMARK_FEE: NearToken = NearToken::from_yoctonear(100_000_000_000_000_000_000_000); // 0.1 NEAR = 10^23 yocto
 
 // ---------------------------------------------------------------------------
 // Data structures
 // ---------------------------------------------------------------------------
 
 #[near(serializers = [borsh, json])]
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct ScoreReport {
     pub account_id: String,
     pub overall_score: u8,
@@ -24,7 +24,7 @@ pub struct ScoreReport {
 }
 
 #[near(serializers = [borsh, json])]
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct ScoreReason {
     pub factor: String,
     pub score: u8,
@@ -32,7 +32,7 @@ pub struct ScoreReason {
 }
 
 #[near(serializers = [borsh, json])]
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct AccountStatus {
     pub account_id: String,
     pub exists: bool,
@@ -48,8 +48,8 @@ pub struct AccountStatus {
 pub struct NameGuard {
     /// Cached scores keyed by AccountId
     pub scores: LookupMap<AccountId, ScoreReport>,
-    /// Protected trademarks (UnorderedSet for O(1) lookups instead of Vec scan)
-    pub trademarks: UnorderedSet<String>,
+    /// Protected trademarks (IterableSet for O(1) lookups)
+    pub trademarks: IterableSet<String>,
     /// Contract owner
     pub owner: AccountId,
 }
@@ -58,7 +58,7 @@ impl Default for NameGuard {
     fn default() -> Self {
         Self {
             scores: LookupMap::new(b"s"),
-            trademarks: UnorderedSet::new(b"t"),
+            trademarks: IterableSet::new(b"t"),
             owner: "nameguard.testnet".parse().unwrap(),
         }
     }
@@ -70,7 +70,7 @@ impl NameGuard {
     pub fn new(owner: AccountId) -> Self {
         Self {
             scores: LookupMap::new(b"s"),
-            trademarks: UnorderedSet::new(b"t"),
+            trademarks: IterableSet::new(b"t"),
             owner,
         }
     }
@@ -345,7 +345,7 @@ fn is_auto_generated(name: &str) -> bool {
 }
 
 /// Generate alternative name suggestions, excluding protected trademarks.
-fn generate_suggestions(name: &str, trademarks: &UnorderedSet<String>) -> Vec<String> {
+fn generate_suggestions(name: &str, trademarks: &IterableSet<String>) -> Vec<String> {
     let base = name
         .trim_end_matches(".near")
         .trim_end_matches(".testnet")
